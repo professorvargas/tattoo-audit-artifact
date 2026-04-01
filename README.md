@@ -35,6 +35,16 @@ No dataset:
 - `environment.yml`: ambiente (conda/mamba)
 
 ## Reprodutibilidade
+## How to run the Tattoo Audit dashboard
+
+The main interactive dashboard used in the paper is implemented in:
+
+`mvp_audit_streamlit.py`
+
+To run it locally:
+
+```bash
+streamlit run mvp_audit_streamlit.py
 ### Criar ambiente
 ```bash
 cd ~/projects/llm-tattoo
