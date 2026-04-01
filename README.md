@@ -1,52 +1,61 @@
-<< 'EOF'
-# llm-tattoo-vlm-benchmark
+# tattoo-audit-artifact
 
-Repositório do projeto de Deep Learning: benchmark de Vision-Language Models (VLMs) no cenário **open-set** do dataset **TSSD2023** (tattoo semantic segmentation), comparando:
+Artifact repository for the paper:
 
-1) **Baseline**: imagem inteira  
-2) **Crop GT (fundo preto)**: recorte usando máscara GT + background preto  
-3) **Crop GT (fundo branco)**: recorte usando máscara GT + background branco  
+**TattooAudit: An Interactive Auditing Layer for Vision–Language Models in Open-Set Tattoo Analysis**
 
-## Objetivo
-Isolar e medir o componente **semântico** (rotulagem textual de classes) das VLMs quando a segmentação é controlada por GT (“segmentação oráculo”), evitando comparar diretamente com métricas pixel-a-pixel de segmentadores.
+This repository contains the benchmark-grounded artifact used in the study, including:
+- evaluation scripts
+- parsing rules
+- exported tables
+- ranking outputs
+- the Tattoo Audit dashboard source code
 
-## Modelos avaliados
+## Dataset
+
+The public dataset used in the study is TSSD2023:
+https://github.com/Brilhador/tssd2023
+
+## Objective
+
+This project evaluates Vision–Language Models (VLMs) in an **open-set** tattoo-analysis scenario using oracle segmentation derived from ground-truth masks. The goal is to isolate the **semantic naming** component of the models, rather than evaluating pixel-level segmentation.
+
+The study compares three input conditions:
+1. **Baseline**: full image
+2. **GT crop (black background)**: crop derived from the GT mask over a black background
+3. **GT crop (white background)**: crop derived from the GT mask over a white background
+
+## Evaluated models
+
 - Gemma3
 - Qwen2.5-VL
 - LLaMA 3.2 Vision
 
-## Métrica principal: micro-F1 (multi-label por imagem)
-Para cada imagem:
-- `GT` = conjunto de classes verdadeiras
-- `Pred` = conjunto de classes previstas (após parsing/mapeamento para vocabulário controlado)
+## Main metric
 
-Definições:
+For each image:
+- `GT` = set of ground-truth labels
+- `Pred` = set of predicted labels after parsing and normalization
+
+Definitions:
 - `TP = |GT ∩ Pred|`
-- `FP = |Pred \\ GT|`
-- `FN = |GT \\ Pred|`
+- `FP = |Pred \ GT|`
+- `FN = |GT \ Pred|`
 
-No dataset:
-`micro-F1 = 2TP / (2TP + FP + FN)`
+Dataset-level micro-F1:
+- `micro-F1 = 2TP / (2TP + FP + FN)`
 
-## Estrutura do repositório
-- `run_experiments.py`: orquestração geral
-- `experiments/`: scripts de geração de crops, execução das VLMs, parsing, métricas, agregações e geração de figuras/tabelas
-- `data_meta/`: metadados pequenos (ex.: `tssd2023_id2name.json`)
-- `environment.yml`: ambiente (conda/mamba)
+## Repository structure
 
-## Reprodutibilidade
+- `run_experiments.py`: general orchestration
+- `experiments/`: crop generation, VLM execution, parsing, metrics, aggregations, and figure/table generation
+- `data_meta/`: small metadata files
+- `environment.yml`: conda/mamba environment
+- `mvp_audit_streamlit.py`: main Tattoo Audit dashboard
+
 ## How to run the Tattoo Audit dashboard
 
-The main interactive dashboard used in the paper is implemented in:
-
-`mvp_audit_streamlit.py`
-
-To run it locally:
+Run locally with:
 
 ```bash
 streamlit run mvp_audit_streamlit.py
-### Criar ambiente
-```bash
-cd ~/projects/llm-tattoo
-mamba env create -f environment.yml
-mamba activate llm-tattoo
