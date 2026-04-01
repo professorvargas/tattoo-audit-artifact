@@ -13,7 +13,7 @@ This repository contains the benchmark-grounded artifact used in the study, incl
 
 ## Dataset
 
-The public dataset used in the study is TSSD2023:
+The public dataset used in the study is **TSSD2023**:  
 https://github.com/Brilhador/tssd2023
 
 ## Objective
@@ -52,6 +52,7 @@ Dataset-level micro-F1:
 - `data_meta/`: small metadata files
 - `environment.yml`: conda/mamba environment
 - `mvp_audit_streamlit.py`: main Tattoo Audit dashboard
+- `datasets/`: local data required to run the dashboard and reproduce the evaluated views
 
 ## How to run the Tattoo Audit dashboard
 
