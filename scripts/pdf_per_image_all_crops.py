@@ -1,91 +1,65 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-pdf_per_image_all_crops.py
 
-Gera 1 PDF por image_id contendo:
-- imagem baseline
-- crops black e crops white (para cada crop/segmento existente)
-- máscara colorida (mask_rgb) da imagem inteira
-- tabela de predições (Gemma3 / LLaMA / Qwen) com status: PERFECT / HALLUCINATION / UNKNOWN / MISS
-
-Fonte das predições (recomendado): planilha DL_all_vlms_baseline_black_white_tables.xlsx (aba "per_crop").
-
-Uso (exemplo):
-  cd ~/projects/llm-tattoo
-  pip install -U reportlab openpyxl pillow
-  python3 scripts/pdf_per_image_all_crops.py \
-    --splits test_open \
-    --image_ids 4954893280_86e164e92f_b,10257634316_82ecfe9f0f_z,196339401_64bbc02202_b \
-    --outdir pdf_per_image_demo \
-    --tables_xlsx DL_all_vlms_baseline_black_white_tables.xlsx
-"""
 import argparse
 import os
 import glob
-from typing import Dict, Tuple, Any, List, Optional
+from typing import Dict, Tuple, Any, List, Optional, Set
 
 from openpyxl import load_workbook
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.utils import ImageReader
 
-# -----------------------------
-# Helpers: labels / status
-# -----------------------------
+VARIANT_ALIASES = {
+    "baseline":     ["baseline"],
+    "crops_black":  ["crops_black", "crop_black", "black"],
+    "crops_white":  ["crops_white", "crop_white", "white"],
+}
+
 def _to_str(x) -> str:
     return "" if x is None else str(x)
 
 def parse_labels(s: Any) -> List[str]:
-    """
-    pred_labels pode vir com ',' ou ';' como separador.
-    """
     if s is None:
         return []
     ss = str(s).strip()
     if ss == "" or ss.lower() == "nan":
         return []
-    # normaliza separadores
     ss = ss.replace(";", ",")
-    parts = [p.strip() for p in ss.split(",")]
-    parts = [p for p in parts if p]
-    # remove duplicados preservando ordem
-    seen = set()
-    out = []
+    parts = [p.strip() for p in ss.split(",") if p.strip()]
+    out, seen = [], set()
     for p in parts:
         if p not in seen:
             seen.add(p)
             out.append(p)
     return out
 
-def compute_status(gt_crop_label: str, pred: List[str]) -> str:
-    """
-    Classificação simples por crop:
-      - MISS: pred vazio
-      - PERFECT: pred == {gt}
-      - HALLUCINATION: pred contém gt + extras OU não contém gt mas pred não-vazio (FP-only)
-      - UNKNOWN: pred == {"unknown"} (e gt != unknown)
-    """
+def parse_gt_image_labels(s: Any) -> Set[str]:
+    if s is None:
+        return set()
+    ss = str(s).strip()
+    if ss == "" or ss.lower() == "nan":
+        return set()
+    # GT image-level costuma vir com ';'
+    ss = ss.replace(",", ";")
+    parts = [p.strip() for p in ss.split(";") if p.strip()]
+    return set([p for p in parts])
+
+def compute_status_crop(gt_crop_label: str, pred: List[str]) -> str:
     gt = gt_crop_label.strip()
     pset = set(pred)
 
     if len(pset) == 0:
         return "MISS"
-
     if pset == {"unknown"} and gt != "unknown":
         return "UNKNOWN"
-
     if gt and (pset == {gt}):
         return "PERFECT"
-
     if gt and (gt in pset):
         return "HALLUCINATION" if len(pset - {gt}) > 0 else "PERFECT"
-
     return "HALLUCINATION"
 
-# -----------------------------
-# Helpers: filesystem
-# -----------------------------
 def find_first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if p and os.path.exists(p):
@@ -93,28 +67,24 @@ def find_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 def find_baseline_image(split: str, image_id: str) -> Optional[str]:
-    # tenta jpg e png
-    patterns = [
+    return find_first_existing([
         f"datasets/{split}/images/{image_id}.jpg",
         f"datasets/{split}/images/{image_id}.jpeg",
         f"datasets/{split}/images/{image_id}.png",
-    ]
-    return find_first_existing(patterns)
+    ])
 
 def find_mask_rgb(split: str, image_id: str) -> Optional[str]:
-    patterns = [
+    return find_first_existing([
         f"datasets/{split}/mask_rgb/{image_id}_mask.jpg",
         f"datasets/{split}/mask_rgb/{image_id}_mask.png",
         f"datasets/{split}/mask_rgb/{image_id}_mask.jpeg",
-    ]
-    return find_first_existing(patterns)
+    ])
 
 def list_crop_files(split: str, image_id: str) -> List[str]:
     d = f"datasets/crops_gt/{split}/{image_id}"
     if not os.path.isdir(d):
         return []
-    crops = sorted([os.path.basename(p) for p in glob.glob(os.path.join(d, "*.png"))])
-    return crops
+    return sorted([os.path.basename(p) for p in glob.glob(os.path.join(d, "*.png"))])
 
 def path_crop_black(split: str, image_id: str, crop_file: str) -> Optional[str]:
     return find_first_existing([f"datasets/crops_gt/{split}/{image_id}/{crop_file}"])
@@ -122,30 +92,23 @@ def path_crop_black(split: str, image_id: str, crop_file: str) -> Optional[str]:
 def path_crop_white(split: str, image_id: str, crop_file: str) -> Optional[str]:
     return find_first_existing([f"datasets/crops_gt_white/{split}/{image_id}/{crop_file}"])
 
-# -----------------------------
-# Load XLSX ("per_crop") -> dict
-# -----------------------------
 def load_per_crop_xlsx(xlsx_path: str) -> Dict[Tuple[str, str, str, str, str], Dict[str, Any]]:
-    """
-    Retorna dict com chave:
-      (split, variant, image_id, crop_file, model)
-    e valor com campos úteis:
-      pred_labels, fp_labels_not_in_gt, n_fp, gt_labels_image, crop_gt_label_from_filename, ...
-    """
     wb = load_workbook(xlsx_path, data_only=True, read_only=True)
     if "per_crop" not in wb.sheetnames:
-        raise RuntimeError(f"A planilha '{xlsx_path}' não possui aba 'per_crop'. Abas: {wb.sheetnames}")
+        raise RuntimeError(f"Planilha sem aba 'per_crop'. Abas: {wb.sheetnames}")
 
     ws = wb["per_crop"]
     rows = ws.iter_rows(values_only=True)
     header = next(rows)
     idx = {str(h).strip(): i for i, h in enumerate(header)}
 
-    required = ["split", "variant", "image_id", "crop_file", "pred_labels", "model", "fp_labels_not_in_gt", "n_fp",
-                "gt_labels_image", "crop_gt_label_from_filename"]
+    required = [
+        "split","variant","image_id","crop_file","pred_labels","model",
+        "fp_labels_not_in_gt","n_fp","gt_labels_image","crop_gt_label_from_filename"
+    ]
     missing = [c for c in required if c not in idx]
     if missing:
-        raise RuntimeError(f"Colunas ausentes em per_crop: {missing}. Colunas presentes: {list(idx.keys())}")
+        raise RuntimeError(f"Colunas ausentes em per_crop: {missing}")
 
     data: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
     for r in rows:
@@ -165,13 +128,14 @@ def load_per_crop_xlsx(xlsx_path: str) -> Dict[Tuple[str, str, str, str, str], D
         }
     return data
 
-# -----------------------------
-# PDF drawing
-# -----------------------------
+def lookup_row(per_crop, split, variant_key, image_id, crop_file, model):
+    for v in VARIANT_ALIASES.get(variant_key, [variant_key]):
+        k = (split, v, image_id, crop_file, model)
+        if k in per_crop:
+            return per_crop[k]
+    return {}
+
 def draw_image_fit(c: canvas.Canvas, img_path: str, x: float, y: float, w: float, h: float) -> None:
-    """
-    Desenha imagem preservando aspect ratio dentro da caixa (x,y,w,h).
-    """
     ir = ImageReader(img_path)
     iw, ih = ir.getSize()
     if iw <= 0 or ih <= 0:
@@ -183,10 +147,6 @@ def draw_image_fit(c: canvas.Canvas, img_path: str, x: float, y: float, w: float
     c.drawImage(ir, ox, oy, width=nw, height=nh, preserveAspectRatio=True, mask='auto')
 
 def write_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_chars: int, line_height: float) -> float:
-    """
-    Escreve texto quebrando por tamanho aproximado de caracteres.
-    Retorna novo y.
-    """
     if not text:
         return y
     words = text.split(" ")
@@ -203,35 +163,73 @@ def write_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_chars: in
         y -= line_height
     return y
 
-def make_pdf_for_image(
-    out_pdf: str,
-    split: str,
-    image_id: str,
-    per_crop: Dict[Tuple[str, str, str, str, str], Dict[str, Any]],
-    models: List[str],
-) -> None:
-    os.makedirs(os.path.dirname(out_pdf), exist_ok=True)
+def baseline_metrics(gt_set: Set[str], pred: List[str], n_fp: int):
+    pred_set = set(pred)
+    pred_n = len(pred)
+    hit_any = (len(pred_set & gt_set) > 0) if gt_set else False
+    hit_with_fp = (hit_any and n_fp > 0)
+    fp_pct = (n_fp / pred_n) if pred_n > 0 else 0.0
+    miss_n = len(gt_set - pred_set) if gt_set else 0
+    perfect = (pred_set == gt_set) and bool(gt_set)
+    return hit_any, hit_with_fp, fp_pct, pred_n, miss_n, perfect
 
+def crop_metrics(gt_crop: str, pred: List[str], n_fp: int):
+    pred_n = len(pred)
+    hit = (gt_crop in pred)
+    hit_with_fp = (hit and n_fp > 0)
+    fp_pct = (n_fp / pred_n) if pred_n > 0 else 0.0
+    status = compute_status_crop(gt_crop, pred)
+    return hit, hit_with_fp, fp_pct, pred_n, status
+
+def per_image_crop_stats(split, image_id, crop_files, per_crop, model, variant_key):
+    total = 0
+    hit = 0
+    hit_fp = 0
+    sum_fp_pct = 0.0
+    sum_nfp = 0.0
+
+    for crop_file in crop_files:
+        gt = os.path.splitext(crop_file)[0]
+        row = lookup_row(per_crop, split, variant_key, image_id, crop_file, model)
+        if not row:
+            continue
+        pred = parse_labels(row.get("pred_labels"))
+        nfp = int(row.get("n_fp") or 0)
+        is_hit, is_hit_fp, fp_pct, _, _status = crop_metrics(gt, pred, nfp)
+
+        total += 1
+        if is_hit:
+            hit += 1
+            sum_fp_pct += fp_pct
+            sum_nfp += nfp
+            if is_hit_fp:
+                hit_fp += 1
+
+    cond = (hit_fp / hit) if hit > 0 else 0.0
+    mean_fp_pct = (sum_fp_pct / hit) if hit > 0 else 0.0
+    mean_nfp = (sum_nfp / hit) if hit > 0 else 0.0
+    return total, hit, hit_fp, cond, mean_fp_pct, mean_nfp
+
+def make_pdf_for_image(out_pdf, split, image_id, per_crop, models):
+    os.makedirs(os.path.dirname(out_pdf), exist_ok=True)
     page_w, page_h = landscape(A4)
     c = canvas.Canvas(out_pdf, pagesize=(page_w, page_h))
 
     baseline_path = find_baseline_image(split, image_id)
     mask_path = find_mask_rgb(split, image_id)
-    crops = list_crop_files(split, image_id)
+    crop_files = list_crop_files(split, image_id)
 
-    if not crops:
-        crops = []  # ainda geramos PDF com 1 página (baseline + tabela baseline)
-
-    # para obter GT (image-level) de forma estável, pegamos de qualquer linha baseline
-    gt_image = None
+    # GT image-level (da planilha)
+    gt_image_str = ""
+    gt_set = set()
     for m in models:
-        k = (split, "baseline", image_id, "__full_image__", m)
-        if k in per_crop:
-            gt_image = per_crop[k].get("gt_labels_image")
+        row = lookup_row(per_crop, split, "baseline", image_id, "__full_image__", m)
+        if row:
+            gt_image_str = _to_str(row.get("gt_labels_image")).strip()
+            gt_set = parse_gt_image_labels(gt_image_str)
             break
-    gt_image_str = _to_str(gt_image).strip()
 
-    def draw_header(title: str):
+    def draw_header(title):
         c.setFont("Helvetica-Bold", 14)
         c.drawString(40, page_h - 40, title)
         c.setFont("Helvetica", 10)
@@ -239,138 +237,171 @@ def make_pdf_for_image(
         if gt_image_str:
             c.drawString(40, page_h - 75, f"GT (image-level): {gt_image_str}")
 
-    # Layout constants
     margin_x = 40
     top_y = page_h - 95
     img_box_w = (page_w - 2 * margin_x - 3 * 15) / 4.0
     img_box_h = 220
     gap = 15
-
-    # Table area
     table_top = top_y - img_box_h - 20
     line_h = 13
 
-    def draw_images_row(crop_file: Optional[str]):
-        labels = ["Baseline", "Crop black", "Crop white", "Mask"]
-        paths = [
-            baseline_path,
-            path_crop_black(split, image_id, crop_file) if crop_file else None,
-            path_crop_white(split, image_id, crop_file) if crop_file else None,
-            mask_path,
-        ]
+    def draw_images_summary():
+        # Baseline + Mask (sem bordas)
+        labels = ["Baseline", "Mask"]
+        paths = [baseline_path, mask_path]
+
         x = margin_x
         y = top_y - img_box_h
+        box_w = (page_w - 2 * margin_x - gap) / 2.0
+
         for lab, p in zip(labels, paths):
             c.setFont("Helvetica-Bold", 10)
             c.drawString(x, top_y + 2, lab)
-            c.rect(x, y, img_box_w, img_box_h, stroke=1, fill=0)
+
             if p and os.path.exists(p):
-                draw_image_fit(c, p, x + 2, y + 2, img_box_w - 4, img_box_h - 18)
+                draw_image_fit(c, p, x, y, box_w, img_box_h)
             else:
                 c.setFont("Helvetica", 9)
                 c.drawString(x + 4, y + img_box_h / 2, "(missing)")
-            x += img_box_w + gap
 
-    def row_for(model: str, variant: str, crop_file: str) -> Dict[str, Any]:
-        k = (split, variant, image_id, crop_file, model)
-        return per_crop.get(k, {})
+            x += box_w + gap
 
-    def row_baseline(model: str) -> Dict[str, Any]:
-        return row_for(model, "baseline", "__full_image__")
+    def draw_images_crops(crop_file: str):
+        # Crop black + Crop white (sem bordas) — igual ao PDF antigo
+        labels = ["Crop black", "Crop white"]
+        paths = [
+            path_crop_black(split, image_id, crop_file),
+            path_crop_white(split, image_id, crop_file),
+        ]
 
-    def row_black(model: str, crop_file: str) -> Dict[str, Any]:
-        return row_for(model, "crops_black", crop_file)
+        x = margin_x
+        y = top_y - img_box_h
+        box_w = (page_w - 2 * margin_x - gap) / 2.0
 
-    def row_white(model: str, crop_file: str) -> Dict[str, Any]:
-        return row_for(model, "crops_white", crop_file)
+        for lab, p in zip(labels, paths):
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(x, top_y + 2, lab)
 
-    def format_pred_block(gt_crop: str, d: Dict[str, Any]) -> Tuple[str, str, str, int]:
-        pred = parse_labels(d.get("pred_labels"))
-        # fp pode vir pronto na planilha; se estiver vazio, calculamos por pred-gt
-        fp_raw = d.get("fp_labels_not_in_gt")
-        fp = parse_labels(fp_raw)
-        if not fp and pred:
-            fp = [p for p in pred if p != gt_crop]
-        status = compute_status(gt_crop, pred)
-        return status, ",".join(pred), ",".join(fp), int(d.get("n_fp") or 0)
+            if p and os.path.exists(p):
+                draw_image_fit(c, p, x, y, box_w, img_box_h)
+            else:
+                c.setFont("Helvetica", 9)
+                c.drawString(x + 4, y + img_box_h / 2, "(missing)")
 
-    if not crops:
-        # PDF só com baseline
-        draw_header("VLM per-image PDF (no crops found)")
-        draw_images_row(None)
-        y = table_top
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_x, y, "Predictions (baseline)")
-        y -= 18
+            x += box_w + gap
+
+    # ===== Page 1: resumo + métricas =====
+    draw_header("Per-image summary + conditional hallucination (when GT is present)")
+    draw_images_summary()
+
+    y = table_top
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(margin_x, y, "Baseline (image-level) + Crops (conditional hallucination on hits)")
+    y -= 18
+    c.setFont("Helvetica", 9)
+
+    for model in models:
+        # baseline row
+        brow = lookup_row(per_crop, split, "baseline", image_id, "__full_image__", model)
+        bpred = parse_labels(brow.get("pred_labels"))
+        bnfp = int(brow.get("n_fp") or 0)
+        hit_any, hit_fp, fp_pct, pred_n, miss_n, perfect = baseline_metrics(gt_set, bpred, bnfp)
+
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(margin_x, y, f"- {model}")
+        y -= line_h
         c.setFont("Helvetica", 9)
-        for model in models:
-            base = row_baseline(model)
-            status, pred_s, fp_s, nfp = format_pred_block("", base)
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(margin_x, y, f"{model}: {status}")
-            y -= line_h
+        c.drawString(margin_x + 14, y,
+                     f"baseline: hit_any={'YES' if hit_any else 'NO'} | perfect={'YES' if perfect else 'NO'} | miss_n={miss_n} | n_fp={bnfp} | pred_n={pred_n} | FP%={fp_pct*100:.1f}% | hit+FP={'YES' if hit_fp else 'NO'}")
+        y -= line_h
+
+        # crops black stats (por modelo)
+        tb, hb, hfpb, condb, meanfpb, meannfpb = per_image_crop_stats(split, image_id, crop_files, per_crop, model, "crops_black")
+        c.drawString(margin_x + 14, y,
+                     f"crops_black: hits={hb}/{tb} | hit+FP={hfpb} | P(FP>0|hit)={condb*100:.1f}% | mean FP% on hit={meanfpb*100:.1f}% | mean n_fp on hit={meannfpb:.2f}")
+        y -= line_h
+
+        # crops white stats (por modelo)
+        tw, hw, hfpw, condw, meanfpw, meannfpw = per_image_crop_stats(split, image_id, crop_files, per_crop, model, "crops_white")
+        c.drawString(margin_x + 14, y,
+                     f"crops_white: hits={hw}/{tw} | hit+FP={hfpw} | P(FP>0|hit)={condw*100:.1f}% | mean FP% on hit={meanfpw*100:.1f}% | mean n_fp on hit={meannfpw:.2f}")
+        y -= (line_h + 6)
+
+        if y < 60:
+            c.showPage()
+            draw_header("(cont.) Per-image summary")
+            draw_images_summary()
+            y = table_top
             c.setFont("Helvetica", 9)
-            y = write_wrapped(c, f"pred=[{pred_s}]", margin_x + 14, y, 120, line_h)
-            y = write_wrapped(c, f"fp=[{fp_s}] n_fp={nfp}", margin_x + 14, y, 120, line_h)
-            y -= 4
-        c.showPage()
-        c.save()
-        return
 
-    # 1 página por crop (tudo no MESMO PDF)
-    for i, crop_file in enumerate(crops, start=1):
-        crop_gt = os.path.splitext(crop_file)[0]  # ex: eagle.png -> eagle
+    c.showPage()
 
-        draw_header(f"Crop {i}/{len(crops)}: {crop_file}  (GT crop-level: {crop_gt})")
-        draw_images_row(crop_file)
+    # ===== Pages: 1 por crop =====
+    for i, crop_file in enumerate(crop_files, start=1):
+        gt_crop = os.path.splitext(crop_file)[0]
+        draw_header(f"Crop {i}/{len(crop_files)}: {crop_file} (GT crop-level: {gt_crop})")
+        draw_images_crops(crop_file)
 
-        # Predictions table
         y = table_top
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_x, y, "Predictions + status (baseline / crop_black / crop_white)")
+        c.drawString(margin_x, y, "Per-crop predictions (NEW: HIT and FP%)")
         y -= 18
-
         c.setFont("Helvetica", 9)
-        for model in models:
-            base = row_baseline(model)
-            blk = row_black(model, crop_file)
-            wht = row_white(model, crop_file)
 
-            b_status, b_pred, b_fp, b_nfp = format_pred_block(crop_gt, base)
-            k_status, k_pred, k_fp, k_nfp = format_pred_block(crop_gt, blk)
-            w_status, w_pred, w_fp, w_nfp = format_pred_block(crop_gt, wht)
+        for model in models:
+            # baseline (sempre comparado ao GT image-level)
+            #brow = lookup_row(per_crop, split, "baseline", image_id, "__full_image__", model)
+            #bpred = parse_labels(brow.get("pred_labels"))
+            #bnfp = int(brow.get("n_fp") or 0)
+            #hit_any, hit_fp, b_fp_pct, b_pred_n, miss_n, perfect = baseline_metrics(gt_set, bpred, bnfp)
+
+            # crop black / white (comparado ao GT do crop)
+            blkrow = lookup_row(per_crop, split, "crops_black", image_id, crop_file, model)
+            whtrow = lookup_row(per_crop, split, "crops_white", image_id, crop_file, model)
+
+            kpred = parse_labels(blkrow.get("pred_labels"))
+            knfp = int(blkrow.get("n_fp") or 0)
+            whpred = parse_labels(whtrow.get("pred_labels"))
+            whnfp = int(whtrow.get("n_fp") or 0)
+
+            k_hit, k_hit_fp, k_fp_pct, k_pred_n, k_status = crop_metrics(gt_crop, kpred, knfp)
+            w_hit, w_hit_fp, w_fp_pct, w_pred_n, w_status = crop_metrics(gt_crop, whpred, whnfp)
 
             c.setFont("Helvetica-Bold", 9)
             c.drawString(margin_x, y, f"- {model}")
             y -= line_h
-
             c.setFont("Helvetica", 9)
-            y = write_wrapped(c, f"baseline: {b_status}  pred=[{b_pred}]  fp=[{b_fp}]  n_fp={b_nfp}", margin_x + 14, y, 160, line_h)
-            y = write_wrapped(c, f"crop_black: {k_status}  pred=[{k_pred}]  fp=[{k_fp}]  n_fp={k_nfp}", margin_x + 14, y, 160, line_h)
-            y = write_wrapped(c, f"crop_white: {w_status}  pred=[{w_pred}]  fp=[{w_fp}]  n_fp={w_nfp}", margin_x + 14, y, 160, line_h)
-            y -= 6
 
-            # evita estourar página; se estiver no fim, nova página (continua mesmo crop)
+            y = write_wrapped(
+                c,
+                f"crop_black: {k_status} | hit={'YES' if k_hit else 'NO'} | n_fp={knfp} | pred_n={k_pred_n} | FP%={k_fp_pct*100:.1f}% | hit+FP={'YES' if k_hit_fp else 'NO'} | pred=[{','.join(kpred)}]",
+                margin_x + 14, y, 190, line_h
+            )
+            y = write_wrapped(
+                c,
+                f"crop_white: {w_status} | hit={'YES' if w_hit else 'NO'} | n_fp={whnfp} | pred_n={w_pred_n} | FP%={w_fp_pct*100:.1f}% | hit+FP={'YES' if w_hit_fp else 'NO'} | pred=[{','.join(whpred)}]",
+                margin_x + 14, y, 190, line_h
+            )
+            y -= 8
+
             if y < 60:
                 c.showPage()
-                draw_header(f"(cont.) Crop {i}/{len(crops)}: {crop_file}  (GT: {crop_gt})")
-                y = page_h - 110
+                draw_header(f"(cont.) Crop {i}/{len(crop_files)}: {crop_file}")
+                draw_images_crops(crop_file)
+                y = table_top
                 c.setFont("Helvetica", 9)
 
         c.showPage()
 
     c.save()
 
-# -----------------------------
-# CLI
-# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--splits", required=True, help="Ex: test_open ou test_closed (pode ser lista separada por vírgula)")
-    ap.add_argument("--image_ids", default="", help="Lista separada por vírgula. Se vazio, pega todos do XLSX para o split.")
-    ap.add_argument("--outdir", required=True, help="Diretório de saída dos PDFs")
-    ap.add_argument("--tables_xlsx", default="DL_all_vlms_baseline_black_white_tables.xlsx", help="Planilha com aba per_crop")
-    ap.add_argument("--models", default="gemma3,llama3_2_vision,qwen2_5_vl", help="Lista separada por vírgula")
+    ap.add_argument("--splits", required=True, help="test_open,test_closed")
+    ap.add_argument("--image_ids", default="", help="lista separada por vírgula; se vazio, gera para todas do split")
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--tables_xlsx", default="DL_all_vlms_baseline_black_white_tables.xlsx")
+    ap.add_argument("--models", default="gemma3,llama3_2_vision,qwen2_5_vl")
     args = ap.parse_args()
 
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
@@ -381,23 +412,14 @@ def main():
 
     per_crop = load_per_crop_xlsx(args.tables_xlsx)
 
-    # Se image_ids vazio, coletamos todos da planilha para cada split
-    if args.image_ids.strip():
-        image_ids = [x.strip() for x in args.image_ids.split(",") if x.strip()]
-        by_split = {s: image_ids for s in splits}
-    else:
-        by_split = {}
-        for s in splits:
-            ids = sorted({k[2] for k in per_crop.keys() if k[0] == s})
-            by_split[s] = ids
-
     for split in splits:
-        ids = by_split.get(split, [])
-        if not ids:
-            print(f"[WARN] Nenhuma image_id encontrada para split={split}")
-            continue
+        if args.image_ids.strip():
+            image_ids = [x.strip() for x in args.image_ids.split(",") if x.strip()]
+        else:
+            img_dir = f"datasets/{split}/images"
+            image_ids = sorted([os.path.splitext(p)[0] for p in os.listdir(img_dir) if p.lower().endswith(".jpg")])
 
-        for image_id in ids:
+        for image_id in image_ids:
             out_pdf = os.path.join(args.outdir, split, f"{image_id}.pdf")
             try:
                 make_pdf_for_image(out_pdf, split, image_id, per_crop, models)
